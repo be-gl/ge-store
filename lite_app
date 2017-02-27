@@ -1,0 +1,145 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+
+use lib '/var/mojo/apps/ge/store/lib';
+use Store::Model::Orders;
+use Mojo::Pg;
+use Mojo::JSON 'j';
+
+plugin 'Config';
+plugin AssetPack => {
+  pipes => [qw(Sass Css JavaScript Fetch Combine)]
+};
+
+helper pg => sub { state $pg = Mojo::Pg->new(shift->config('pg')) };
+helper orders => sub { state $orders = Store::Model::Orders->new(pg => shift->pg) };
+helper is_production => sub {
+  my $c = shift;
+  $c->session(mode => 'production') unless $c->session('mode');
+  $c->session('mode') eq 'production' ? 1 : 0;
+};
+helper 'stripe.key' => sub {
+  my $c = shift;
+  my $ps = shift or return;
+  if ( $c->is_production ) {
+    if ( $ps eq 'public' ) {
+      return $c->app->config('stripe')->{pk_live};
+    } elsif ( $ps eq 'secret' ) {
+      return $c->app->config('stripe')->{sk_live};
+    }
+  } else {
+    if ( $ps eq 'public' ) {
+      return $c->app->config('stripe')->{pk_test};
+    } elsif ( $ps eq 'secret' ) {
+      return $c->app->config('stripe')->{sk_test};
+    }
+  }
+};
+
+my $path = app->home->rel_file('migrations/store.sql');
+app->pg->migrations->name('store')->from_file($path)->migrate;
+
+app->asset->process(
+  "app.js" => ("https://checkout.stripe.com/checkout.js", 'https://unpkg.com/axios/dist/axios.min.js')
+);
+app->asset->process(
+  "app.css" => ('sass/cart.scss', 'https://maxcdn.bootstrapcdn.com/font-awesome/4.5.0/css/font-awesome.min.css')
+);
+
+get '/' => 'store-front';
+get '/mode/:mode' => sub {
+  my $c = shift;
+  $c->session(mode => $c->param('mode'))->redirect_to('store-front');
+} => 'mode';
+get '/js/cart' => sub { shift->render('js/cart') };
+
+post '/checkout' => sub {
+  my $c = shift;
+  my $id = $c->orders->add($c->req->json);
+  $c->render(json => $id ? {id => $id} : {});
+};
+
+get '/purchase/:id' => sub {
+  my $c = shift;
+  $c->stash(cart => $c->orders->find($c->param('id')));
+} => 'purchase';
+
+post '/send-money/:id' => sub {
+  my $c = shift;
+  $c->render_later;
+  $c->orders->save($c->param('id'), {stripe_token => $c->param('stripeToken'), email => $c->param('stripeEmail'), name => $c->param('name')});
+  my $cart = $c->orders->find($c->param('id'));
+  my $sk = $c->stripe->key('secret');
+  $c->ua->post("https://$sk\@api.stripe.com/v1/charges" => form => {amount => $cart->{carttotal} * 100, currency => 'usd', description => "Order $cart->{id}", receipt_email => $c->param('stripeEmail'), source => $c->param('stripeToken')} => sub {
+    my ($ua, $tx) = @_;
+    $c->orders->save($c->param('id'), {stripe => j($tx->res->json)}); # Why j() here on save (update) but not on add (insert)?
+    $c->flash(seller_message => $tx->res->json->{outcome}->{seller_message}, id => $c->param('id'))->redirect_to('store-front');
+  });
+} => 'send-money';
+
+app->start;
+
+__DATA__
+
+@@ store-front.html.ep
+% layout 'default';
+% title 'G and E Adams Store';
+  %# https://codepen.io/mjweaver01/pen/yerzox
+  <div id="vue">
+    <cart :cart="cart" :cart-sub-total="cartSubTotal" :tax="tax" :cart-total="cartTotal" :checkout-bool="checkoutBool"></cart>
+    <products :cart="cart" :cart-sub-total="cartSubTotal" :tax="tax" :cart-total="cartTotal" :products-data="productsData"></products>
+    <checkout-area v-if="checkoutBool" :cart="cart" :tax="tax" :cart-sub-total="cartSubTotal" :cart-total="cartTotal" :products-data="productsData" :total-with-tax="totalWithTax"></checkout-area>
+  </div>
+%= javascript '/js/cart.js'
+
+@@ purchase.html.ep
+% layout 'default';
+% title 'G and E Adams Store';
+%= form_for 'send-money' => {id => param 'id'} => (method => 'POST') => begin
+  <div>
+    %= label_for name => 'Name on Order'
+    %= text_field 'name'
+  </div>
+  <script
+    src="https://checkout.stripe.com/checkout.js" class="stripe-button"
+    data-key="<%= $c->stripe->key('public') %>"
+    data-amount="<%= $cart->{carttotal} * 100 %>"
+    data-name="adams.fm"
+    data-description="Widget"
+    data-image="https://stripe.com/img/documentation/checkout/marketplace.png"
+    data-locale="auto">
+  </script>
+% end
+%= link_to Cancel => 'store-front'
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head>
+    <title><%= is_production ? '' : 'Stripe Test: ' %><%= title %></title>
+    %= asset 'app.css'
+    %= asset 'app.js'
+    %= javascript 'https://cdnjs.cloudflare.com/ajax/libs/vue/1.0.11/vue.js'
+  </head>
+  <body>
+    <div class="main-wrapper">
+      <div class="header">
+        <h1>ADAMS FAMILY SHIRTS</h1>
+        <h2>- ORDER FORM -</h2>
+        <p>We are changing out our reunion shirts!  For adults, we are moving to a "heathered" shirt, which is made of a more breathable material than our current shirts.  
+        (The material for the kids shirts will be more similar to the ones we have now.)  We are also changing the colors slightly.  The available shirts are as follows:</p>
+      </div>
+      % if ( flash 'seller_message' ) {
+        <div class="seller_message">Order <%= flash 'id' %> - <%= flash 'seller_message' %></div>
+      % }
+      <div>
+      % if ( is_production ) {
+        %= link_to 'Stripe Test' => url_for 'mode', mode => 'test'
+      % } else {
+        %= link_to 'Stripe Production' => url_for 'mode', mode => 'production'
+      % }
+      </div>
+      <%= content %>
+    </div>
+  </body>
+</html>
